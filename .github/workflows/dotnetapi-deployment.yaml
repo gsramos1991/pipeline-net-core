@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: __CONTAINER_NAME__
+  labels:
+    app: __CONTAINER_NAME__
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: __CONTAINER_NAME__
+  template:
+    metadata:
+      labels:
+        app: __CONTAINER_NAME__
+    spec:
+      containers:
+        - name: __CONTAINER_NAME__
+          image: __IMAGE__
+          ports:
+            - containerPort: 80 # Porta padrão .NET 8
+          
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+           envFrom:
+             - secretRef:
+                 name: key-vault-env-secret
+            #  - configMapRef:
+            #      name: game-env-configmap
+          
+          env:
+            - name: ASPNETCORE_URLS
+              value: "http://+:80"
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Production"
+
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "300m"      
+            limits:
+              memory: "1Gi" 
+              cpu: "600m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-__CONTAINER_NAME__
+  labels:
+    app: svc-__CONTAINER_NAME__
+spec:
+  type: LoadBalancer
+  selector:
+    app: __CONTAINER_NAME__
+  ports:
+    - port: __NUMBER_PORT__
+      targetPort: 80

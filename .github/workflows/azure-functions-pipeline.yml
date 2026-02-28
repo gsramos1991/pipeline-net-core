@@ -1,0 +1,27 @@
+name: Azure Functions CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  build-and-deploy:
+    uses: ./.github/workflows/app-dispatcher.yml
+    with:
+      nome_projeto: functionapp
+      nome_sistema: plataforma-funcoes
+      dotnet_project_file: azure-functions/src/FunctionApp/FunctionApp.csproj
+      publish_directory: ./publish/functionapp
+      dockerfile_path: docker/FunctionApp.Dockerfile
+      kubernetes_template: Workflows_BETA_PIPELINE/kubernetes/functionapp-deployment.yaml
+      container_name: functionapp
+    secrets:
+      docker_username: ${{ secrets.DOCKER_USERNAME }}
+      docker_password: ${{ secrets.DOCKER_PASSWORD }}
+      kubeconfig_b64: ${{ secrets.KUBECONFIG_B64 }}
+      url_key_vault: ${{ secrets.URL_KEY_VAULT }}

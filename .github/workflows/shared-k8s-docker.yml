@@ -1,0 +1,150 @@
+name: Shared Docker Build & Deploy
+
+on:
+  workflow_call:
+    inputs:
+      nome_projeto:
+        description: "Identificador único do artefato (usado no nome da imagem)"
+        required: true
+        type: string
+      #nome_container_pod:
+      #  description: "Nome do container?pod dentro do Registry/Deployment (usado para substituir no template)"
+      #  required: true
+      #  type: string
+      nome_csproj:
+        description: "Caminho para o .csproj que será publicado"
+        required: true
+        type: string
+      nome_csproj_tests:
+        description: "Caminho para o .csproj de testes que será publicado"
+        required: true
+        type: string
+      nome_imagem:
+        description: "Nome do container dentro do Registry/Deployment (usado para substituir no template)"
+        required: true
+        type: string
+    outputs:
+      image_tag:
+        description: "Tag da imagem Docker gerada neste build"
+        value: ${{ jobs.build-and-push.outputs.image_tag }}
+      should_deploy:
+        description: "Indica se o branch atual deve prosseguir para deploy"
+        value: ${{ jobs.build-and-push.outputs.should_deploy }}
+
+jobs:
+  build-and-push:
+    runs-on:
+      - self-hosted
+      - windows
+    outputs:
+      image_tag: ${{ steps.set-outputs.outputs.image_tag }}
+      should_deploy: ${{ steps.set-outputs.outputs.should_deploy }}
+    env:
+      IS_RELEASE_BRANCH: ${{ github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/heads/release/') }}
+      DOCKERFILE_PATH: ./Dockerfile
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Contexto do build
+        run: echo "Projeto ${{ inputs.nome_projeto }} | Build ${{ github.run_number }}"
+
+      - name: Configurar .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Verificar projeto principal
+        id: check-main-project
+        run: |
+          $path1 = ".\src\${{ inputs.nome_projeto }}\${{ inputs.nome_csproj }}.csproj"
+          $path2 = ".\src\${{ inputs.nome_csproj }}.csproj"
+          
+          if (Test-Path $path1) {
+            Write-Host "Projeto principal encontrado em: $path1"
+            "main_project_path=$path1" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "main_exists=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } elseif (Test-Path $path2) {
+            Write-Host "Projeto principal encontrado em: $path2"
+            "main_project_path=$path2" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "main_exists=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } else {
+            Write-Host "Projeto principal NÃO encontrado em nenhum dos caminhos."
+            "main_exists=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 1
+          }
+
+
+      - name: Restaurar dependências
+        if: steps.check-main-project.outputs.main_exists == 'true'
+        run: |
+          dotnet restore
+          
+      - name: Build
+        if: steps.check-main-project.outputs.main_exists == 'true'
+        run: dotnet build ${{ steps.check-main-project.outputs.main_project_path }} --configuration Release --no-restore
+
+
+      - name: Verificar projeto de testes
+        id: check-test-project
+        run: |
+          $path1 = ".\tests\${{ inputs.nome_csproj_tests }}\${{ inputs.nome_csproj_tests }}.csproj"
+          $path2 = ".\tests\${{ inputs.nome_csproj_tests }}.csproj"
+          
+          if (Test-Path $path1) {
+            Write-Host "Projeto de testes encontrado em: $path1"
+            "test_project_path=$path1" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "test_exists=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } elseif (Test-Path $path2) {
+            Write-Host "Projeto de testes encontrado em: $path2"
+            "test_project_path=$path2" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            "test_exists=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } else {
+            Write-Host "Projeto de testes NÃO encontrado em nenhum dos caminhos."
+            "test_exists=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 1
+          }
+
+      - name: Test
+        if: steps.check-test-project.outputs.test_exists == 'true'
+        run: dotnet test ${{ steps.check-test-project.outputs.test_project_path }} --configuration Release --no-restore --verbosity normal
+      
+      - name: Verificar se Dockerfile existe
+        if: env.IS_RELEASE_BRANCH == 'True'
+        id: check-dockerfile
+        run: |
+          $exists = Test-Path "$env:DOCKERFILE_PATH" -PathType Leaf
+          "dockerfile_exists=$exists" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      
+      - name: Build Docker image
+        if: env.IS_RELEASE_BRANCH == 'True' && steps.check-dockerfile.outputs.dockerfile_exists == 'True'
+        id: set-image-tag
+        run: |
+          if (-not $env:DOCKER_REGISTRY_USER) {
+            Write-Error "Variável de ambiente DOCKER_REGISTRY_USER não encontrada no runner. Configure-a nas variáveis de ambiente do sistema."
+            exit 1
+          }
+          $nomeImagem = "${{ inputs.nome_imagem }}".ToLower()
+          $tag = "docker.io/$env:DOCKER_REGISTRY_USER/$nomeImagem" + ":${{ github.run_number }}"
+          "IMAGE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "IMAGE_TAG=$tag"
+          docker build -t $tag -f $env:DOCKERFILE_PATH .
+          
+
+      - name: Push Docker image
+        if: env.IS_RELEASE_BRANCH == 'True' && steps.check-dockerfile.outputs.dockerfile_exists == 'True'
+        run: docker push $env:IMAGE_TAG
+      # - name: Build Docker image
+      #   if: env.IS_RELEASE_BRANCH == 'True' && steps.check-dockerfile.outputs.dockerfile_exists == 'True'
+      #   run: docker build -t $env:IMAGE_TAG -f $env:DOCKERFILE_PATH .
+
+
+
+      - name: Definir outputs
+        if: env.IS_RELEASE_BRANCH == 'True'
+        id: set-outputs
+        run: |
+          $imageTag = "$env:IMAGE_TAG"
+          $shouldDeploy = "$env:IS_RELEASE_BRANCH"
+          "image_tag=$imageTag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "should_deploy=$shouldDeploy" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append

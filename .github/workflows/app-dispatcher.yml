@@ -1,0 +1,41 @@
+name: Shared Pipeline Dispatcher
+
+on:
+  workflow_call:
+    inputs:
+      nome_projeto:
+        required: true
+        type: string
+      nome_csproj:
+        required: true
+        type: string
+      nome_csproj_tests:
+        required: true
+        type: string
+      nome_imagem:
+        required: true
+        type: string
+      porta_pod:
+        required: true
+        type: number
+
+jobs:
+  build:
+    uses: ./.github/workflows/shared-k8s-docker.yml
+    with:
+      nome_projeto: ${{ inputs.nome_projeto }}
+      nome_csproj: ${{ inputs.nome_csproj }}
+      nome_csproj_tests: ${{ inputs.nome_csproj_tests }}
+      nome_imagem: ${{ inputs.nome_imagem }}
+    
+  deploy:
+    needs: build
+    if: needs.build.outputs.should_deploy == 'true'
+    uses: ./.github/workflows/deploy-k8s.yml
+    with:
+      nome_projeto: ${{ inputs.nome_projeto }}
+      nome_imagem: ${{ inputs.nome_imagem }}
+      porta_pod: ${{ inputs.porta_pod }}
+      image_tag: ${{ needs.build.outputs.image_tag }}
+    #secrets:
+      # kubeconfig_b64: ${{ secrets.kubeconfig_b64 }}

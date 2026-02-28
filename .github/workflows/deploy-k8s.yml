@@ -1,0 +1,177 @@
+name: KUBERNETES DEPLOYMENT
+
+on:
+  workflow_call:
+    inputs:
+      nome_projeto:
+        description: "Identificador do artefato (apenas para logs)"
+        required: true
+        type: string
+      nome_imagem:
+        description: "Nome do POD/Deployment dentro do Registry (usado para substituir no template)"
+        required: true
+        type: string
+      image_tag:
+        description: "Imagem Docker que será aplicada"
+        required: true
+        type: string
+      porta_pod:
+        required: true
+        type: number
+
+jobs:
+  deploy:
+    runs-on:
+      - self-hosted
+      - windows
+    env:
+      CONTAINER_NAME: ${{ inputs.nome_imagem }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      PORTA_POD: ${{ inputs.porta_pod }}
+    steps:
+      - name: Contexto do deploy
+        run: |
+          if ([string]::IsNullOrEmpty("${{ inputs.image_tag }}")) {
+            throw "image_tag não pode ser vazio"
+          }
+          Write-Host "Projeto ${{ inputs.nome_projeto }} | Imagem ${{ inputs.image_tag }}"
+
+      #- name: Configurar kubeconfig
+      #  run: |
+      #    $kubeDir = Join-Path $HOME ".kube"
+      #    New-Item -ItemType Directory -Path $kubeDir -Force | Out-Null
+      #    $configPath = Join-Path $kubeDir "config"
+      #    $decoded = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("${{ secrets.kubeconfig_b64 }}"))
+      #    Set-Content -Path $configPath -Value $decoded -Encoding UTF8
+
+      - name: Criar Secret Azure no Kubernetes
+        run: |
+          # Lê as variáveis de ambiente do próprio Windows (runner self-hosted)
+          $clientId     = $env:AZURE_CLIENT_ID
+          $tenantId     = $env:AZURE_TENANT_ID
+          $clientSecret = $env:AZURE_CLIENT_SECRET
+
+          if ([string]::IsNullOrEmpty($clientId) -or [string]::IsNullOrEmpty($tenantId) -or [string]::IsNullOrEmpty($clientSecret)) {
+            throw "Uma ou mais variáveis de ambiente Azure (AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_CLIENT_SECRET) não estão definidas no Windows."
+          }
+
+          kubectl create secret generic azure-credentials `
+            --from-literal=AZURE_CLIENT_ID="$clientId" `
+            --from-literal=AZURE_TENANT_ID="$tenantId" `
+            --from-literal=AZURE_CLIENT_SECRET="$clientSecret" `
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          Write-Host "Secret azure-credentials aplicado com sucesso."
+
+      - name: Gerar e aplicar manifesto
+        id: deploy
+        run: |
+          $containerName = "${{ inputs.nome_imagem }}".ToLower()
+          $nomeImagem    = "${{ inputs.image_tag }}"
+          $portaPod      = "${{ inputs.porta_pod }}"
+
+          # Manifesto construído como array de linhas (evita here-string que quebra o parser YAML do GitHub Actions)
+          $lines = @(
+            "apiVersion: apps/v1",
+            "kind: Deployment",
+            "metadata:",
+            "  name: __CONTAINER_NAME__",
+            "  labels:",
+            "    app: __CONTAINER_NAME__",
+            "spec:",
+            "  replicas: 1",
+            "  selector:",
+            "    matchLabels:",
+            "      app: __CONTAINER_NAME__",
+            "  template:",
+            "    metadata:",
+            "      labels:",
+            "        app: __CONTAINER_NAME__",
+            "    spec:",
+            "      containers:",
+            "        - name: __CONTAINER_NAME__",
+            "          image: __IMAGE__",
+            "          ports:",
+            "            - containerPort: 80",
+            "          envFrom:",
+            "            - secretRef:",
+            "                name: key-vault-env-secret",
+            "            - secretRef:",
+            "                name: grafana-oltp",
+            "            - secretRef:",
+            "                name: function-sensor-config",
+            "            - secretRef:",
+            "                name: function-storage",
+            "          env:",
+            "            - name: ASPNETCORE_URLS",
+            "              value: 'http://+:80'",
+            "            - name: ASPNETCORE_ENVIRONMENT",
+            "              value: 'Production'",
+            "            - name: AZURE_CLIENT_ID",
+            "              valueFrom:",
+            "                secretKeyRef:",
+            "                  name: azure-credentials",
+            "                  key: AZURE_CLIENT_ID",
+            "            - name: AZURE_TENANT_ID",
+            "              valueFrom:",
+            "                secretKeyRef:",
+            "                  name: azure-credentials",
+            "                  key: AZURE_TENANT_ID",
+            "            - name: AZURE_CLIENT_SECRET",
+            "              valueFrom:",
+            "                secretKeyRef:",
+            "                  name: azure-credentials",
+            "                  key: AZURE_CLIENT_SECRET",
+            "          resources:",
+            "            requests:",
+            "              memory: '512Mi'",
+            "              cpu: '300m'",
+            "            limits:",
+            "              memory: '1Gi'",
+            "              cpu: '600m'",
+            "---",
+            "apiVersion: v1",
+            "kind: Service",
+            "metadata:",
+            "  name: svc-__CONTAINER_NAME__",
+            "  labels:",
+            "    app: svc-__CONTAINER_NAME__",
+            "spec:",
+            "  type: LoadBalancer",
+            "  selector:",
+            "    app: __CONTAINER_NAME__",
+            "  ports:",
+            "    - port: __NUMBER_PORT__",
+            "      targetPort: 80"
+          )
+          $manifest = $lines -join "`n"
+
+          # Substituir placeholders
+          $manifest = $manifest -replace '__CONTAINER_NAME__', $containerName
+          $manifest = $manifest -replace '__IMAGE__',           $nomeImagem
+          $manifest = $manifest -replace '__NUMBER_PORT__',     $portaPod
+
+          # Salvar manifesto temporário
+          $outPath = Join-Path $env:TEMP "$containerName-deployment.yaml"
+          Set-Content -Path $outPath -Value $manifest -Encoding UTF8
+          Write-Host "Manifesto gerado em: $outPath"
+          "manifest_path=$outPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          # Validar (dry-run)
+          Write-Host "=== Validando manifesto (dry-run) ==="
+          kubectl apply -f $outPath --dry-run=client
+
+          # Aplicar
+          Write-Host "=== Aplicando manifesto ==="
+          kubectl apply -f $outPath
+          kubectl rollout status deployment/$containerName --timeout=180s
+
+      - name: Limpar manifesto temporário
+        if: always()
+        env:
+          MANIFEST_PATH: ${{ steps.deploy.outputs.manifest_path }}
+        run: |
+          if (Test-Path $env:MANIFEST_PATH) {
+            Remove-Item $env:MANIFEST_PATH -Force
+            Write-Host "Manifesto temporário removido."
+          }
